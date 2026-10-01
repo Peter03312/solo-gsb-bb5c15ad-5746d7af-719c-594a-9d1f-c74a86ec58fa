@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from . import service
 from .database import SessionLocal, init_db
 from .schemas import (
+    ChipReplaceIn,
+    ChipTimelineOut,
     ClockOffsetIn,
     ClockOffsetListOut,
     ErrorBody,
@@ -56,10 +58,9 @@ def get_db() -> Iterator[Session]:
 
 @app.exception_handler(service.ApiError)
 async def api_error_handler(_: Request, exc: service.ApiError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.error, "detail": exc.detail},
-    )
+    content = {"error": exc.error, "detail": exc.detail}
+    content.update(exc.extra)
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 # --------------------------------------------------------------------------
@@ -181,9 +182,46 @@ def put_clock_offset(
 
 
 # --------------------------------------------------------------------------
-# Results & sealing
+# Mid-race chip replacement
 # --------------------------------------------------------------------------
 
+
+@app.post(
+    "/races/{race_id}/chip-replacements",
+    response_model=ChipTimelineOut,
+    status_code=201,
+    tags=["chip-replacement"],
+    responses={
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+    },
+)
+def register_chip_replacement(
+    race_id: str,
+    payload: ChipReplaceIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    return service.register_chip_replacement(db, race_id, payload)
+
+
+@app.get(
+    "/races/{race_id}/runners/{runner_id}/chip-timeline",
+    response_model=ChipTimelineOut,
+    tags=["chip-replacement"],
+    responses={404: {"model": ErrorBody}},
+)
+def get_chip_timeline(
+    race_id: str,
+    runner_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    return service.chip_timeline(db, race_id, runner_id)
+
+
+# --------------------------------------------------------------------------
+# Results & sealing
+# --------------------------------------------------------------------------
 
 @app.get("/races/{race_id}/results", tags=["results"])
 def race_results(race_id: str, db: Session = Depends(get_db)) -> dict:

@@ -78,10 +78,75 @@ curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
 echo "## revoke a scan"
 curl -fsS -X DELETE "$BASE_URL/races/$RACE_ID/scans/S2"; echo
 
-echo "## seal (snapshot frozen; later submit/revoke/offset change get 409)"
-curl -fsS -X POST "$BASE_URL/races/$RACE_ID/seal"; echo
+# ---------------------------------------------------------------------------
+# Mid-race chip replacement
+# ---------------------------------------------------------------------------
+# A fresh race keeps the window arithmetic readable: start T0, cutoff T0+1h,
+# one point FIN; runner 2 binds CHIP-R. Create it and capture the runner id.
+R2_JSON=$(curl -fsS -X POST "$BASE_URL/races" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"name\": \"chip replacement curl demo\",
+    \"start_time\": \"$T0\",
+    \"cutoff_time\": \"$(AT 3600)\",
+    \"points\": [{\"code\": \"FIN\", \"name\": \"Finish\", \"is_finish\": true}],
+    \"segments\": [{\"min_seconds\": 0, \"max_seconds\": 3600}],
+    \"runners\": [{\"bib\": \"2\", \"name\": \"Ruth\", \"chip\": \"CHIP-R\"}]
+  }")
+R2_ID=$(echo "$R2_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+R2_RUNNER=$(echo "$R2_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["runners"][0]["id"])')
 
-echo "## offset change after sealing (HTTP 409)"
-curl -sS -o /dev/null -w '%{http_code}\n' -X PUT \
-  "$BASE_URL/races/$RACE_ID/points/C1/offset" \
-  -H 'Content-Type: application/json' -d '{"offset_seconds": 0}'
+echo "## chip timeline before any replacement (one unbounded window)"
+curl -fsS "$BASE_URL/races/$R2_ID/runners/$R2_RUNNER/chip-timeline"; echo
+
+echo "## register a replacement CHIP-R2 effective at T0+20min (201)"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\": \"$R2_RUNNER\", \"new_chip\": \"CHIP-R2\", \"effective_at\": \"$(AT 1200)\"}"
+
+echo "## reused chip is refused (HTTP 409 chip_already_used)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\": \"$R2_RUNNER\", \"new_chip\": \"CHIP-R\", \"effective_at\": \"$(AT 1500)\"}"
+
+echo "## effective time outside [start, cutoff] is refused (HTTP 422)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\": \"$R2_RUNNER\", \"new_chip\": \"CHIP-RX\", \"effective_at\": \"$(AT 3601)\"}"
+
+echo "## old-chip scan at/after the effective instant is rejected (HTTP 409)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{\"scan_no\":\"R-OLD20\",\"chip\":\"CHIP-R\",\"point\":\"FIN\",\"occurred_at\":\"$(AT 1200)\"}"
+
+echo "## new-chip scan at the effective instant is accepted (HTTP 201)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{\"scan_no\":\"R-NEW20\",\"chip\":\"CHIP-R2\",\"point\":\"FIN\",\"occurred_at\":\"$(AT 1200)\"}"
+
+echo "## out-of-order late upload at an old raw instant uses old windows (HTTP 201)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{\"scan_no\":\"R-OLD10\",\"chip\":\"CHIP-R\",\"point\":\"FIN\",\"occurred_at\":\"$(AT 600)\"}"
+
+echo "## one more new-chip scan at T0+30min (HTTP 201)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{\"scan_no\":\"R-NEW30\",\"chip\":\"CHIP-R2\",\"point\":\"FIN\",\"occurred_at\":\"$(AT 1800)\"}"
+
+echo "## 2nd replacement at T0+25min would invalidate R-NEW30 (HTTP 409 + conflicts)"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\": \"$R2_RUNNER\", \"new_chip\": \"CHIP-R3\", \"effective_at\": \"$(AT 1500)\"}"
+
+echo "## seal (snapshot frozen; later submit/revoke/offset/replacement get 409)"
+curl -fsS -X POST "$BASE_URL/races/$RACE_ID/seal"; echo
+curl -fsS -X POST "$BASE_URL/races/$R2_ID/seal" >/dev/null; echo "race 2 sealed"
+
+echo "## chip replacement after sealing (HTTP 409)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$R2_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\": \"$R2_RUNNER\", \"new_chip\": \"CHIP-AFTER\", \"effective_at\": \"$(AT 1800)\"}"
+
+echo "## chip timeline stays readable after sealing"
+curl -fsS "$BASE_URL/races/$R2_ID/runners/$R2_RUNNER/chip-timeline"; echo

@@ -121,6 +121,30 @@ class ClockOffsetIn(BaseModel):
     offset_seconds: int = Field(strict=True)
 
 
+class ChipReplaceIn(BaseModel):
+    """Register one mid-race chip replacement.
+
+    The new chip must not have been used in this race before (neither as an
+    original binding nor by an earlier replacement of any runner); the
+    effective instant must fall inside [start_time, cutoff_time] and be
+    strictly later than this runner's previous replacement effective time.
+    """
+
+    runner_id: str = Field(..., min_length=1)
+    new_chip: str = Field(..., min_length=1, max_length=128)
+    effective_at: datetime
+
+    @field_validator("new_chip")
+    @classmethod
+    def _strip_chip(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("effective_at")
+    @classmethod
+    def _time_utc(cls, v: datetime) -> datetime:
+        return _as_utc(v)
+
+
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------
@@ -147,7 +171,8 @@ class RunnerOut(BaseModel):
     id: str
     bib: str
     name: str
-    chip: str
+    chip: str  # original binding (configuration is fixed)
+    current_chip: str  # chip valid right now (changes with replacements)
 
 
 class RaceOut(BaseModel):
@@ -168,6 +193,10 @@ class UsedScanOut(BaseModel):
     segment: int
     point: str
     scan_no: str
+    # Raw chip code the observation was submitted with. Optional only so
+    # snapshots sealed before the chip-replacement feature still validate
+    # (the stored snapshot is never rewritten); new snapshots always carry it.
+    chip: Optional[str] = None
     occurred_at: datetime  # raw device timestamp as submitted
     calibrated_at: datetime  # occurred_at + point clock offset
     offset_seconds: int
@@ -178,7 +207,9 @@ class RunnerResultOut(BaseModel):
     runner_id: str
     bib: str
     name: str
-    chip: str
+    chip: str  # original binding (configuration is fixed)
+    # Optional solely for pre-feature sealed snapshots; new payloads set it.
+    current_chip: Optional[str] = None
     status: Literal["finished", "did_not_finish"]
     finish_time: Optional[datetime]
     total_seconds: Optional[float]
@@ -214,6 +245,30 @@ class ClockOffsetListOut(BaseModel):
     race_id: str
     offset_version: int
     offsets: list[ClockOffsetOut]
+
+
+class ChipPeriodOut(BaseModel):
+    sequence: int  # 0 = original binding, 1.. = nth replacement
+    chip: str
+    is_initial: bool
+    # Half-open [effective_from, effective_to); null means unbounded on that
+    # side (the original chip has no left edge, the current chip no right).
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+    is_current: bool
+    # Present only for replacement chips (sequence >= 1).
+    registered_at: Optional[datetime] = None
+
+
+class ChipTimelineOut(BaseModel):
+    race_id: str
+    runner_id: str
+    bib: str
+    name: str
+    original_chip: str
+    current_chip: str
+    replacement_count: int
+    periods: list[ChipPeriodOut]
 
 
 class ErrorBody(BaseModel):

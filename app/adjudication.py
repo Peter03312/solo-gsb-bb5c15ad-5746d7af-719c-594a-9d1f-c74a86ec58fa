@@ -54,6 +54,86 @@ class Segment:
 
 
 @dataclass(frozen=True)
+class ChipPeriod:
+    """Half-open chip validity window ``[effective_from, effective_to)``.
+
+    The runner's originally bound chip is ``sequence == 0`` and has
+    ``effective_from is None``: it is valid at every instant before the
+    first replacement takes effect (including scans stamped before the race
+    start). The latest (current) chip has ``effective_to is None`` and stays
+    valid indefinitely. At the replacement instant itself the *new* chip is
+    already valid and the old one is not (half-open boundary).
+    """
+
+    sequence: int  # 0 = original binding, 1.. = nth replacement
+    chip: str
+    effective_from: Optional[datetime]
+    effective_to: Optional[datetime]
+    is_initial: bool
+
+    def contains(self, instant: datetime) -> bool:
+        instant = _normalise(instant)
+        if self.effective_from is not None and instant < _normalise(self.effective_from):
+            return False
+        if self.effective_to is not None and instant >= _normalise(self.effective_to):
+            return False
+        return True
+
+
+def build_chip_periods(
+    initial_chip: str,
+    replacements: Sequence[tuple[int, str, datetime]] = (),
+) -> tuple[ChipPeriod, ...]:
+    """Build a runner's ordered chip windows.
+
+    ``replacements`` is an ordered sequence of
+    ``(sequence, chip, effective_at)`` (sequence 1-based). The original chip
+    owns the window up to the first replacement; every replacement owns the
+    window from its own effective instant up to the next replacement.
+    """
+
+    ordered = sorted(replacements, key=lambda r: r[0])
+    # Boundary n introduces its chip at its effective instant; the original
+    # chip has no left boundary.
+    boundaries: list[tuple[int, str, Optional[datetime]]] = [
+        (0, initial_chip, None)
+    ]
+    for sequence, chip, effective_at in ordered:
+        boundaries.append((sequence, chip, _normalise(effective_at)))
+
+    periods: list[ChipPeriod] = []
+    for i, (sequence, chip, effective_from) in enumerate(boundaries):
+        effective_to = (
+            boundaries[i + 1][2] if i + 1 < len(boundaries) else None
+        )
+        periods.append(
+            ChipPeriod(
+                sequence=sequence,
+                chip=chip,
+                effective_from=effective_from,
+                effective_to=effective_to,
+                is_initial=(i == 0),
+            )
+        )
+    return tuple(periods)
+
+
+def active_period_at(
+    periods: Sequence[ChipPeriod], instant: datetime
+) -> Optional[ChipPeriod]:
+    """Return the chip window valid at ``instant`` (raw device time).
+
+    Windows are half-open and contiguous, so at most one matches; ``None``
+    means the instant is outside every chip window of this runner.
+    """
+
+    for period in periods:
+        if period.contains(instant):
+            return period
+    return None
+
+
+@dataclass(frozen=True)
 class Scan:
     """One chip observation at a point.
 

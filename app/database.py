@@ -91,6 +91,11 @@ class Race(Base):
     clock_offsets: Mapped[list["ClockOffset"]] = relationship(
         back_populates="race", cascade="all, delete-orphan"
     )
+    chip_replacements: Mapped[list["ChipReplacement"]] = relationship(
+        back_populates="race",
+        cascade="all, delete-orphan",
+        order_by="ChipReplacement.sequence",
+    )
 
 
 class Point(Base):
@@ -180,10 +185,56 @@ class Runner(Base):
     scans: Mapped[list["Scan"]] = relationship(
         back_populates="runner", cascade="all, delete-orphan"
     )
+    chip_replacements: Mapped[list["ChipReplacement"]] = relationship(
+        back_populates="runner", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         UniqueConstraint("race_id", "bib", name="uq_runner_race_bib"),
         UniqueConstraint("race_id", "chip_code", name="uq_runner_race_chip"),
+    )
+
+
+class ChipReplacement(Base):
+    """One registered mid-race chip replacement for a runner.
+
+    The new chip is valid from ``effective_at`` (inclusive) until the next
+    replacement's effective instant (exclusive). The current (last) chip
+    stays valid indefinitely. Replacements are append-only: existing rows,
+    scan rows and their original chip codes are never rewritten.
+    """
+
+    __tablename__ = "chip_replacements"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    race_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("races.id", ondelete="CASCADE"), nullable=False
+    )
+    runner_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("runners.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # 1-based: this runner's n-th replacement (the original binding is 0).
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    chip_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    race: Mapped[Race] = relationship(back_populates="chip_replacements")
+    runner: Mapped[Runner] = relationship(back_populates="chip_replacements")
+
+    __table_args__ = (
+        # One runner cannot replace twice at the same sequence; a chip may be
+        # introduced only once within a race.
+        UniqueConstraint("race_id", "runner_id", "sequence",
+                         name="uq_chiprepl_race_runner_seq"),
+        UniqueConstraint("race_id", "chip_code",
+                         name="uq_chiprepl_race_chip"),
     )
 
 
@@ -205,6 +256,10 @@ class Scan(Base):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    # Raw chip code submitted with the scan, frozen at ingestion. It is the
+    # chip that was valid for the runner at the raw occurred_at; chip
+    # replacement never rewrites this column.
+    chip_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
@@ -268,3 +323,19 @@ def init_db(max_retries: int = 30, delay_seconds: float = 1.0) -> None:
         raise RuntimeError(f"database not reachable: {last_error}")
 
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight additive migration for deployments whose scans table
+    # predates the chip-replacement feature. create_all never alters existing
+    # tables, so add the raw chip_code column in place when it is missing;
+    # rows created before the migration fall back to the runner's original
+    # chip binding (NULL is coalesced on read).
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "scans" in inspector.get_table_names():
+        scan_columns = {col["name"] for col in inspector.get_columns("scans")}
+        if "chip_code" not in scan_columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE scans ADD COLUMN chip_code VARCHAR(128)")
+                )

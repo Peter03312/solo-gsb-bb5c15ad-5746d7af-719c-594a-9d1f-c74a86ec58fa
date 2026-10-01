@@ -13,7 +13,14 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.adjudication import Scan, Segment, UsedScan, adjudicate_runner  # noqa: E402
+from app.adjudication import (  # noqa: E402
+    Scan,
+    Segment,
+    UsedScan,
+    active_period_at,
+    adjudicate_runner,
+    build_chip_periods,
+)
 
 UTC = timezone.utc
 T0 = datetime(2026, 10, 1, 8, 0, 0, tzinfo=UTC)
@@ -277,6 +284,64 @@ def test_offset_preserves_used_scan_fields():
         42.0,
     )
     check("segment seconds shifted", u.segment_seconds, 642.0)
+
+
+# --------------------------------------------------------------------------
+# Chip replacement windows: half-open intervals matched on raw device time,
+# including out-of-order (late) retransmission semantics.
+# --------------------------------------------------------------------------
+
+
+def t(minute: int, second: int = 0) -> datetime:
+    return T0 + timedelta(minutes=minute, seconds=second)
+
+
+def test_chip_periods_single_initial_chip():
+    periods = build_chip_periods("CHIP-0")
+    assert len(periods) == 1
+    p = periods[0]
+    assert p.is_initial and p.chip == "CHIP-0"
+    assert p.effective_from is None and p.effective_to is None
+    # The original chip is valid at every instant with no replacement.
+    assert active_period_at(periods, t(-5)).chip == "CHIP-0"
+    assert active_period_at(periods, t(0)).chip == "CHIP-0"
+    assert active_period_at(periods, t(70)).chip == "CHIP-0"
+
+
+def test_chip_periods_one_replacement_half_open_boundary():
+    periods = build_chip_periods(
+        "CHIP-0", [(1, "CHIP-1", t(15))]
+    )
+    assert [(p.chip, p.effective_from, p.effective_to) for p in periods] == [
+        ("CHIP-0", None, t(15)),
+        ("CHIP-1", t(15), None),
+    ]
+    # Old chip valid strictly before the instant; new chip from the instant.
+    assert active_period_at(periods, t(14, 59)).chip == "CHIP-0"
+    assert active_period_at(periods, t(15)).chip == "CHIP-1"
+    assert active_period_at(periods, t(40)).chip == "CHIP-1"
+    # Original chip remains valid for early (even pre-start) scans.
+    assert active_period_at(periods, t(-1)).chip == "CHIP-0"
+
+
+def test_chip_periods_multiple_replacements_contiguous():
+    periods = build_chip_periods(
+        "CHIP-0",
+        [(1, "CHIP-1", t(15)), (2, "CHIP-2", t(25))],
+    )
+    assert [p.chip for p in periods] == ["CHIP-0", "CHIP-1", "CHIP-2"]
+    assert active_period_at(periods, t(15)).chip == "CHIP-1"
+    assert active_period_at(periods, t(24, 59)).chip == "CHIP-1"
+    assert active_period_at(periods, t(25)).chip == "CHIP-2"
+    assert active_period_at(periods, t(99)).chip == "CHIP-2"
+    # Periods arrive ordered even if replacements are supplied unordered.
+    periods_unordered = build_chip_periods(
+        "CHIP-0",
+        [(2, "CHIP-2", t(25)), (1, "CHIP-1", t(15))],
+    )
+    assert [p.chip for p in periods_unordered] == [
+        "CHIP-0", "CHIP-1", "CHIP-2"
+    ]
 
 
 def _run_all():
