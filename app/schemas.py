@@ -121,6 +121,36 @@ class ClockOffsetIn(BaseModel):
     offset_seconds: int = Field(strict=True)
 
 
+class ChipReplacementIn(BaseModel):
+    """Register a mid-race chip replacement for one runner.
+
+    ``new_chip`` must be a chip never used anywhere in this race before
+    (no other runner's current/previous binding, never introduced as a
+    replacement chip). ``effective_at`` must fall inside the closed
+    start..cutoff window and be later than the runner's previous
+    replacement effective time.
+    """
+
+    new_chip: str = Field(..., min_length=1, max_length=128)
+    effective_at: datetime
+    note: Optional[str] = Field(None, max_length=255)
+
+    @field_validator("new_chip")
+    @classmethod
+    def _strip_chip(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("effective_at")
+    @classmethod
+    def _time_utc(cls, v: datetime) -> datetime:
+        return _as_utc(v)
+
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if v is not None else None
+
+
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------
@@ -168,6 +198,7 @@ class UsedScanOut(BaseModel):
     segment: int
     point: str
     scan_no: str
+    chip: str  # chip actually observed; never rewritten by later replacements
     occurred_at: datetime  # raw device timestamp as submitted
     calibrated_at: datetime  # occurred_at + point clock offset
     offset_seconds: int
@@ -214,6 +245,41 @@ class ClockOffsetListOut(BaseModel):
     race_id: str
     offset_version: int
     offsets: list[ClockOffsetOut]
+
+
+# --------------------------------------------------------------------------
+# Chip replacement outputs
+# --------------------------------------------------------------------------
+
+
+class ChipPeriodOut(BaseModel):
+    sequence: int  # 0 = initial binding, 1.. = replacement chips
+    chip: str
+    valid_from: datetime
+    valid_to: Optional[datetime] = None  # null: open-ended (current chip)
+    is_current: bool
+
+
+class ChipReplacementEventOut(BaseModel):
+    sequence: int
+    old_chip: str
+    new_chip: str
+    effective_at: datetime
+    registered_at: datetime
+    note: Optional[str] = None
+
+
+class ChipTimelineOut(BaseModel):
+    race_id: str
+    runner_id: str
+    bib: str
+    name: str
+    initial_chip: str
+    current_chip: str
+    periods: list[ChipPeriodOut]
+    replacements: list[ChipReplacementEventOut]
+    # Present (true) only on a successful POST that registered a replacement.
+    registered: Optional[bool] = None
 
 
 class ErrorBody(BaseModel):

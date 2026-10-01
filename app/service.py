@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Optional
 
@@ -15,7 +15,16 @@ from sqlalchemy.orm import Session, selectinload
 from .adjudication import Scan as DomainScan
 from .adjudication import Segment as DomainSegment
 from .adjudication import adjudicate_runner
+from .chips import (
+    ChipPeriod,
+    ChipReplacementEvent,
+    active_period_at,
+    build_periods,
+    in_race_window,
+    replacement_conflicts,
+)
 from .database import (
+    ChipReplacement,
     ClockOffset,
     Point,
     Race,
@@ -25,7 +34,7 @@ from .database import (
     SegmentRow,
     utcnow,
 )
-from .schemas import ClockOffsetIn, RaceCreate, ScanCreate
+from .schemas import ChipReplacementIn, ClockOffsetIn, RaceCreate, ScanCreate
 
 
 class ApiError(Exception):
@@ -50,6 +59,14 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     return value
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Timestamps are stored tz-aware UTC; normalise any backend variation."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 # --------------------------------------------------------------------------
@@ -105,7 +122,9 @@ def serialize_race(race: Race) -> dict:
 def serialize_scan(scan: Scan, *, replayed: bool = False) -> dict:
     return {
         "scan_no": scan.scan_no,
-        "chip": scan.runner.chip_code,
+        # The chip the device literally observed; stored on the scan itself
+        # so a later chip replacement never rewrites it.
+        "chip": scan.chip_code,
         "point": scan.point.code,
         "occurred_at": scan.occurred_at,
         "revoked": scan.revoked,
@@ -205,26 +224,29 @@ def create_race(db: Session, payload: RaceCreate) -> Race:
 # --------------------------------------------------------------------------
 
 
-def get_race_locked(db: Session, race_id: str) -> Race:
+def get_race_locked(db: Session, race_id: str, *, fresh: bool = False) -> Race:
     """Race row with SELECT ... FOR UPDATE (serialises every mutating op).
 
-    The lock serialises scan submit/revoke, offset changes and sealing with
-    each other; point/segment/runner/offset collections are eager-loaded so
-    adjudication and offset listing are consistent under the same lock.
+    The lock serialises scan submit/revoke, offset changes, chip
+    replacements and sealing with each other; point/segment/runner/offset
+    collections are eager-loaded so adjudication and listings are consistent
+    under the same lock. ``fresh=True`` forces a database re-read of those
+    collections (used right after a commit within the same session, since
+    expire_on_commit is disabled).
     """
 
     race_id = _valid_uuid(race_id, what="race_id")
-    race = db.get(
-        Race,
-        race_id,
-        with_for_update=True,
-        options=[
-            selectinload(Race.points),
-            selectinload(Race.segments),
-            selectinload(Race.runners),
-            selectinload(Race.clock_offsets),
-        ],
-    )
+    options = [
+        selectinload(Race.points),
+        selectinload(Race.segments),
+        selectinload(Race.runners).selectinload(Runner.chip_replacements),
+        selectinload(Race.clock_offsets),
+        selectinload(Race.chip_replacements),
+    ]
+    stmt = select(Race).where(Race.id == race_id).with_for_update()
+    if fresh:
+        stmt = stmt.execution_options(populate_existing=True)
+    race = db.scalars(stmt.options(*options)).first()
     if race is None:
         raise ApiError(404, "race_not_found", f"race {race_id} does not exist")
     return race
@@ -238,7 +260,7 @@ def get_race(db: Session, race_id: str) -> Race:
         options=[
             selectinload(Race.points),
             selectinload(Race.segments),
-            selectinload(Race.runners),
+            selectinload(Race.runners).selectinload(Runner.chip_replacements),
         ],
     )
     if race is None:
@@ -246,22 +268,115 @@ def get_race(db: Session, race_id: str) -> Race:
     return race
 
 
+def _get_runner_404(db: Session, race: Race, runner_id: str) -> Runner:
+    runner_id = _valid_uuid(runner_id, what="runner_id")
+    runner = db.scalars(
+        select(Runner)
+        .where(Runner.id == runner_id, Runner.race_id == race.id)
+        .execution_options(populate_existing=True)
+        .options(selectinload(Runner.chip_replacements))
+    ).first()
+    if runner is None:
+        raise ApiError(
+            404,
+            "runner_not_found",
+            f"runner {runner_id} does not exist in this race",
+        )
+    return runner
+
+
 # --------------------------------------------------------------------------
 # Scan ingestion
 # --------------------------------------------------------------------------
 
 
+def _runner_periods(
+    race: Race, runner: Runner, events: Optional[list[ChipReplacement]] = None
+) -> tuple[ChipPeriod, ...]:
+    if events is None:
+        events = sorted(
+            runner.chip_replacements,
+            key=lambda e: (_as_utc(e.effective_at), e.sequence),
+        )
+    initial_chip = events[0].old_chip_code if events else runner.chip_code
+    return build_periods(
+        initial_chip=initial_chip,
+        race_start=race.start_time,
+        replacements=[
+            ChipReplacementEvent(
+                sequence=e.sequence,
+                old_chip_code=e.old_chip_code,
+                new_chip_code=e.new_chip_code,
+                effective_at=e.effective_at,
+            )
+            for e in events
+        ],
+    )
+
+
+def _runner_current_chip(runner: Runner) -> str:
+    if not runner.chip_replacements:
+        return runner.chip_code
+    latest = max(
+        runner.chip_replacements,
+        key=lambda e: (_as_utc(e.effective_at), e.sequence),
+    )
+    return latest.new_chip_code
+
+
+def _chip_owner_map(db: Session, race: Race) -> dict[str, tuple[Runner, tuple[ChipPeriod, ...]]]:
+    """chip_code -> (runner, validity periods) for every chip ever bound."""
+
+    owners: dict[str, tuple[Runner, tuple[ChipPeriod, ...]]] = {}
+    for runner in race.runners:
+        periods = _runner_periods(race, runner)
+        for period in periods:
+            owners[period.chip_code] = (runner, periods)
+    return owners
+
+
 def _resolve_scan_refs(
     db: Session, race: Race, payload: ScanCreate
 ) -> tuple[Runner, Point]:
-    runner = db.scalars(
-        select(Runner).where(
-            Runner.race_id == race.id, Runner.chip_code == payload.chip
-        )
-    ).first()
-    if runner is None:
+    """Resolve (chip, occurred_at) -> runner and point -> point.
+
+    The chip is matched against the chip valid for *this runner* at the
+    scan's raw device timestamp (same rule for late/out-of-order uploads):
+
+      * a chip never bound to the race -> 404 unknown_chip;
+      * a chip bound but outside the race window / not active for that
+        runner at that instant -> 409, explicitly rejected;
+      * an unknown point -> 404.
+    """
+
+    owners = _chip_owner_map(db, race)
+    binding = owners.get(payload.chip)
+    if binding is None:
         raise ApiError(404, "unknown_chip",
                        f"chip {payload.chip!r} is not bound to this race")
+    runner, periods = binding
+
+    occurred_at = _as_utc(payload.occurred_at)
+    period = active_period_at(periods, occurred_at)
+    if occurred_at < _as_utc(race.start_time):
+        # Before the start no chip window has begun yet: reject explicitly
+        # instead of silently attributing the observation.
+        raise ApiError(
+            409,
+            "scan_before_race_start",
+            f"scan occurred_at {occurred_at.isoformat()} is before the race "
+            f"start {_as_utc(race.start_time).isoformat()}",
+        )
+    if period is None or period.chip_code != payload.chip:
+        active = active_period_at(periods, occurred_at)
+        active_chip = active.chip_code if active is not None else None
+        raise ApiError(
+            409,
+            "chip_outside_valid_period",
+            f"chip {payload.chip!r} is not valid for runner "
+            f"{runner.bib!r} at {occurred_at.isoformat()}; the chip active "
+            f"then is {active_chip!r}",
+        )
 
     point = db.scalars(
         select(Point).where(
@@ -275,19 +390,23 @@ def _resolve_scan_refs(
 
 
 def _existing_replay_or_conflict(
-    existing: Scan, runner: Runner, point: Point, occurred_at: datetime, scan_no: str
+    existing: Scan, runner: Runner, point: Point, occurred_at: datetime,
+    scan_no: str, chip: str,
 ) -> Optional[Scan]:
     """Return the existing scan for an idempotent replay, else raise.
 
     A revoked scan keeps its unique number: a byte-identical retransmission
     replays as revoked; any other content is a conflict (use a new scan_no
-    for a genuinely new observation).
+    for a genuinely new observation). The comparison includes the chip, so
+    replaying an old scan under a replaced chip still conflicts rather than
+    being silently rewritten.
     """
 
     same = (
         existing.runner_id == runner.id
         and existing.point_id == point.id
-        and existing.occurred_at == occurred_at
+        and _as_utc(existing.occurred_at) == _as_utc(occurred_at)
+        and existing.chip_code == chip
     )
     if not same:
         raise ApiError(
@@ -320,7 +439,8 @@ def submit_scan(
     ).first()
     if existing is not None:
         return _existing_replay_or_conflict(
-            existing, runner, point, payload.occurred_at, payload.scan_no
+            existing, runner, point, payload.occurred_at, payload.scan_no,
+            payload.chip,
         ), True
 
     scan = Scan(
@@ -328,6 +448,7 @@ def submit_scan(
         scan_no=payload.scan_no,
         runner_id=runner.id,
         point_id=point.id,
+        chip_code=payload.chip,
         occurred_at=payload.occurred_at,
         revoked=False,
     )
@@ -390,7 +511,7 @@ def submit_scan_batch(
                 try:
                     replayed = _existing_replay_or_conflict(
                         existing, runner, point,
-                        payload.occurred_at, payload.scan_no,
+                        payload.occurred_at, payload.scan_no, payload.chip,
                     )
                 except ApiError as exc:
                     results.append(
@@ -417,6 +538,7 @@ def submit_scan_batch(
                 scan_no=payload.scan_no,
                 runner_id=runner.id,
                 point_id=point.id,
+                chip_code=payload.chip,
                 occurred_at=payload.occurred_at,
                 revoked=False,
             )
@@ -532,6 +654,11 @@ def _runner_results(
                 "segment": u.segment_position,
                 "point": point_by_scan_no[u.scan_no].code,
                 "scan_no": u.scan_no,
+                # Actual observed chip, taken straight from the scan row;
+                # chip replacements never rewrite it.
+                "chip": next(
+                    s.chip_code for s in runner_scans if s.scan_no == u.scan_no
+                ),
                 "occurred_at": u.occurred_at,
                 "calibrated_at": u.calibrated_at,
                 "offset_seconds": u.offset_seconds,
@@ -671,6 +798,207 @@ def sealed_results_payload(db: Session, race: Race) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Mid-race chip replacement
+# --------------------------------------------------------------------------
+
+
+def _timeline_payload(db: Session, race: Race, runner: Runner) -> dict:
+    """Runner chip timeline: ordered half-open periods + replacement events."""
+
+    periods = _runner_periods(race, runner)
+    events = sorted(
+        db.scalars(
+            select(ChipReplacement).where(
+                ChipReplacement.race_id == race.id,
+                ChipReplacement.runner_id == runner.id,
+            )
+        ).all(),
+        key=lambda e: e.sequence,
+    )
+    current_chip = periods[-1].chip_code
+    return {
+        "race_id": str(race.id),
+        "runner_id": str(runner.id),
+        "bib": runner.bib,
+        "name": runner.name,
+        "initial_chip": periods[0].chip_code,
+        "current_chip": current_chip,
+        "periods": [
+            {
+                "sequence": p.sequence,
+                "chip": p.chip_code,
+                "valid_from": p.valid_from,
+                "valid_to": p.valid_to,
+                "is_current": p.chip_code == current_chip,
+            }
+            for p in periods
+        ],
+        "replacements": [
+            {
+                "sequence": e.sequence,
+                "old_chip": e.old_chip_code,
+                "new_chip": e.new_chip_code,
+                "effective_at": e.effective_at,
+                "registered_at": e.registered_at,
+                "note": getattr(e, "note", None),
+            }
+            for e in events
+        ],
+    }
+
+
+def chip_timeline(db: Session, race_id: str, runner_id: str) -> dict:
+    race = get_race_locked(db, race_id)
+    try:
+        runner = _get_runner_404(db, race, runner_id)
+        return _timeline_payload(db, race, runner)
+    finally:
+        db.commit()  # release the FOR UPDATE row lock immediately
+
+
+def register_chip_replacement(
+    db: Session, race_id: str, runner_id: str, payload: ChipReplacementIn
+) -> dict:
+    """Register one mid-race chip replacement (race-lock serialised).
+
+    The operation is all-or-nothing: sealed race, illegal effective time,
+    reused chip or a conflict with already-received scans all reject the
+    whole request; existing scan chips, scan numbers and ownership are
+    never rewritten. On success the provisional results simply pick up the
+    new binding on the next (on-demand) recompute.
+    """
+
+    race = get_race_locked(db, race_id)
+    if race.sealed:
+        raise ApiError(409, "race_sealed",
+                       "race is sealed; chips cannot be replaced")
+    runner = _get_runner_404(db, race, runner_id)
+
+    effective_at = _as_utc(payload.effective_at)
+    # Closed start..cutoff window; strictly later than the previous
+    # replacement effective time (the first one only has to be >= start).
+    if not in_race_window(effective_at, race.start_time, race.cutoff_time):
+        raise ApiError(
+            422,
+            "invalid_effective_time",
+            f"effective_at {effective_at.isoformat()} must fall inside the "
+            f"race window [{_as_utc(race.start_time).isoformat()}, "
+            f"{_as_utc(race.cutoff_time).isoformat()}]",
+        )
+
+    prior_events = sorted(
+        runner.chip_replacements,
+        key=lambda e: (_as_utc(e.effective_at), e.sequence),
+    )
+    if prior_events and effective_at <= _as_utc(prior_events[-1].effective_at):
+        raise ApiError(
+            422,
+            "invalid_effective_time",
+            "effective_at must be strictly later than the previous chip "
+            f"replacement effective time "
+            f"{_as_utc(prior_events[-1].effective_at).isoformat()}",
+        )
+
+    old_chip = _runner_current_chip(runner)
+    if payload.new_chip == old_chip:
+        raise ApiError(
+            409,
+            "chip_reused",
+            f"new chip {payload.new_chip!r} is the chip already active for "
+            "this runner",
+        )
+
+    # The new chip must never have been used in this race: no other runner's
+    # binding (initial or after replacement) and never introduced before as
+    # a replacement chip.
+    used_chips: set[str] = set()
+    for other in race.runners:
+        other_periods = _runner_periods(race, other)
+        used_chips.update(p.chip_code for p in other_periods)
+    used_chips.update(e.new_chip_code for e in race.chip_replacements)
+    if payload.new_chip in used_chips:
+        raise ApiError(
+            409,
+            "chip_reused",
+            f"chip {payload.new_chip!r} is already used in this race",
+        )
+
+    sequence = (max((e.sequence for e in runner.chip_replacements), default=0)
+                + 1)
+    pending = ChipReplacementEvent(
+        sequence=sequence,
+        old_chip_code=old_chip,
+        new_chip_code=payload.new_chip,
+        effective_at=effective_at,
+    )
+
+    # Every scan ever received for the runner (revoked scans included) must
+    # remain inside a valid chip window after the replacement. The scan's
+    # own chip_code is the truth, so nothing is rewritten here.
+    runner_scans = db.scalars(
+        select(Scan).where(Scan.race_id == race.id, Scan.runner_id == runner.id)
+    ).all()
+    conflicts = replacement_conflicts(
+        initial_chip=_runner_periods(race, runner)[0].chip_code,
+        race_start=race.start_time,
+        replacements=[
+            ChipReplacementEvent(
+                sequence=e.sequence,
+                old_chip_code=e.old_chip_code,
+                new_chip_code=e.new_chip_code,
+                effective_at=e.effective_at,
+            )
+            for e in prior_events
+        ],
+        pending=pending,
+        scans=[(s.chip_code, s.occurred_at) for s in runner_scans],
+    )
+    if conflicts:
+        detail = "; ".join(
+            f"scan chip={chip!r} at {_as_utc(ts).isoformat()} would fall "
+            "outside its valid period"
+            for chip, ts in sorted(
+                conflicts, key=lambda c: (_as_utc(c[1]), c[0])
+            )[:5]
+        )
+        raise ApiError(
+            409,
+            "chip_replacement_conflict",
+            f"replacement rejected: {len(conflicts)} already-received "
+            f"scan(s) would become invalid ({detail})",
+        )
+
+    event_row = ChipReplacement(
+        race_id=race.id,
+        runner_id=runner.id,
+        sequence=sequence,
+        old_chip_code=old_chip,
+        new_chip_code=payload.new_chip,
+        effective_at=effective_at,
+        registered_at=utcnow(),
+        note=payload.note,
+    )
+    db.add(event_row)
+    # The runner's *current* binding moves to the new chip. Initial chip and
+    # every historical scan keep their original chip codes.
+    runner.chip_code = payload.new_chip
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ApiError(409, "chip_reused",
+                       f"chip {payload.new_chip!r} is already used")
+
+    # Reload under a fresh lock for the timeline response.
+    race = get_race_locked(db, race_id, fresh=True)
+    runner = _get_runner_404(db, race, runner_id)
+    body = _timeline_payload(db, race, runner)
+    db.commit()  # release the FOR UPDATE row lock
+    body["registered"] = True
+    return body
+
+
+# --------------------------------------------------------------------------
 # Per-point clock offsets
 # --------------------------------------------------------------------------
 
@@ -768,8 +1096,8 @@ def set_point_offset(
     db.commit()
 
     # Reload under a fresh lock so the response reflects the committed row
-    # (the collection above was not expired with expire_on_commit=False).
-    race = get_race_locked(db, race_id)
+    # (the cached collection is not refreshed with expire_on_commit=False).
+    race = get_race_locked(db, race_id, fresh=True)
     body = _offset_payload(race, only=point.code)
     item = body["offsets"][0]
     item["replaced"] = replaced

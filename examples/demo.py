@@ -22,6 +22,11 @@ The script walks through every requirement:
      / unknown point / sealed races rejected
   7. seal the race -> frozen snapshot (offsets included); afterwards
      submit/revoke/offset change are rejected
+  8. mid-race chip replacement: half-open chip windows matched on the raw
+     device time (out-of-order backfill included), explicit rejection
+     outside windows, all-or-nothing conflicts with received/revoked scans,
+     reused-chip / illegal-time / sealed errors, timeline query, results
+     recomputed across the original and replacement chips
 """
 
 from __future__ import annotations
@@ -42,6 +47,16 @@ CUTOFF = T0 + timedelta(hours=1)
 
 def at(minute: int, second: int = 0) -> str:
     return (T0 + timedelta(minutes=minute, seconds=second)).isoformat()
+
+
+def instant(value: str) -> datetime:
+    """Parse an API timestamp, normalising 'Z'/naive forms to UTC, so the
+    example compares instants regardless of the backend's rendering."""
+
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def request(method: str, path: str, body=None):
@@ -380,10 +395,10 @@ def main() -> None:
     assert row["status"] == "finished"
     finish_used = [u for u in row["used_scans"] if u["point"] == "FIN"][0]
     # Raw scan time is preserved; calibrated time and totals are shifted.
-    assert finish_used["occurred_at"] == at(61)
-    assert finish_used["calibrated_at"] == at(60)
+    assert instant(finish_used["occurred_at"]) == instant(at(61))
+    assert instant(finish_used["calibrated_at"]) == instant(at(60))
     assert finish_used["offset_seconds"] == -60
-    assert row["finish_time"] == at(60)
+    assert instant(row["finish_time"]) == instant(at(60))
     assert row["total_seconds"] == 3600.0
     print("ok provisional result immediately uses the new offset; raw kept")
 
@@ -397,7 +412,7 @@ def main() -> None:
     assert body["offsets"][0]["replaced"] is True
     status, body = request("GET", f"{orp}/results")
     assert body["offset_version"] == 2
-    assert body["results"][0]["finish_time"] == at(59)
+    assert instant(body["results"][0]["finish_time"]) == instant(at(59))
     print("ok replacing an offset bumps the version and recomputes again")
 
     # Non-integer offsets are explicitly refused (pydantic strict int -> 422).
@@ -437,8 +452,8 @@ def main() -> None:
         u for r in sealed_off["results"] for u in r["used_scans"]
         if u["point"] == "FIN"
     ][0]
-    assert snap_finish["occurred_at"] == at(61)
-    assert snap_finish["calibrated_at"] == at(59)
+    assert instant(snap_finish["occurred_at"]) == instant(at(61))
+    assert instant(snap_finish["calibrated_at"]) == instant(at(59))
     print("ok sealed snapshot keeps raw times and calibrated times")
 
     # After sealing: offset changes rejected; the snapshot stays as frozen.
@@ -450,7 +465,7 @@ def main() -> None:
 
     status, body = request("GET", f"{orp}/results")
     assert body["offset_version"] == 2
-    assert body["results"][0]["finish_time"] == at(59)
+    assert instant(body["results"][0]["finish_time"]) == instant(at(59))
     print("ok sealed results are unaffected by later requests")
 
     # The offset query still works on a sealed race (read-only).
@@ -485,6 +500,196 @@ def main() -> None:
     status, body = request("DELETE", f"{rp}/scans/BATCH-1")
     show(status, body)
     expect(409, status, "revocation after sealing rejected")
+
+    # ------------------------------------------------------------------ #
+    step("8. Mid-race chip replacement")
+    # ------------------------------------------------------------------ #
+    # Frank starts on CHIP-F. His chip breaks mid-race: staff register a
+    # replacement to CHIP-F2 effective at minute 15. The timeline shows the
+    # half-open chip windows; scans are matched on the raw device time.
+    status, chip_race_body = request(
+        "POST",
+        "/races",
+        {
+            "name": "Chip replacement demo",
+            "start_time": at(0),
+            "cutoff_time": at(60),
+            "points": [
+                {"code": "C1", "name": "Checkpoint 1"},
+                {"code": "C2", "name": "Checkpoint 2"},
+                {"code": "FIN", "name": "Finish", "is_finish": True},
+            ],
+            "segments": [
+                {"min_seconds": 300, "max_seconds": 3600},
+                {"min_seconds": 300, "max_seconds": 3600},
+                {"min_seconds": 300, "max_seconds": 3600},
+            ],
+            "runners": [
+                {"bib": "F01", "name": "Frank", "chip": "CHIP-F"},
+                {"bib": "G02", "name": "Grace", "chip": "CHIP-G"},
+            ],
+        },
+    )
+    expect(201, status, "chip-replacement race created")
+    crp = f"/races/{chip_race_body['id']}"
+    frank_id = next(
+        r["id"] for r in chip_race_body["runners"] if r["bib"] == "F01"
+    )
+    grace_id = next(
+        r["id"] for r in chip_race_body["runners"] if r["bib"] == "G02"
+    )
+
+    def fscan(scan_no, chip, point, minute):
+        return request(
+            "POST",
+            f"{crp}/scans",
+            {
+                "scan_no": scan_no,
+                "chip": chip,
+                "point": point,
+                "occurred_at": at(minute),
+            },
+        )
+
+    # C1 on the original chip at minute 10 (out-of-order: it is registered
+    # only after the replacement below, which is exactly the late backfill
+    # case -- matching always uses the raw occurred_at).
+    status, _ = request(
+        "POST",
+        f"{crp}/runners/{frank_id}/chip-replacements",
+        {"new_chip": "CHIP-F2", "effective_at": at(15),
+         "note": "cracked casing"},
+    )
+    expect(201, status, "register Frank CHIP-F -> CHIP-F2 at minute 15")
+
+    # Timelines are queryable: initial chip, both half-open windows, events.
+    status, body = request(
+        "GET", f"{crp}/runners/{frank_id}/chip-timeline"
+    )
+    show(status, body)
+    expect(200, status, "query Frank chip timeline")
+    assert body["initial_chip"] == "CHIP-F"
+    assert body["current_chip"] == "CHIP-F2"
+    assert [p["chip"] for p in body["periods"]] == ["CHIP-F", "CHIP-F2"]
+    assert instant(body["periods"][0]["valid_to"]) == instant(at(15))
+    assert body["periods"][1]["valid_to"] is None
+    assert body["replacements"][0]["old_chip"] == "CHIP-F"
+    print("ok timeline shows [start,15)=CHIP-F, [15,inf)=CHIP-F2")
+
+    # Late/out-of-order backfill on the OLD chip, strictly before 15: ok.
+    status, _ = fscan("F-010", "CHIP-F", "C1", 10)
+    expect(201, status, "backfilled old-chip scan before boundary accepted")
+
+    # Old chip at/after the boundary is explicitly rejected; the new chip is
+    # valid exactly at the boundary.
+    status, body = fscan("F-BAD", "CHIP-F", "C2", 15)
+    show(status, body)
+    expect(409, status, "old-chip scan at the boundary rejected")
+    assert body["error"] == "chip_outside_valid_period"
+
+    status, _ = fscan("F-020", "CHIP-F2", "C2", 20)
+    expect(201, status, "new-chip scan after boundary accepted")
+    status, _ = fscan("F-030", "CHIP-F2", "FIN", 30)
+    expect(201, status, "new-chip finish scan accepted")
+
+    # Unknown chip stays a 404; scans outside the race window are rejected.
+    status, body = fscan("F-X", "CHIP-NEVER", "C1", 20)
+    expect(404, status, "unknown chip on scan rejected")
+    status, body = fscan("F-PRE", "CHIP-F", "C1", -1)
+    show(status, body)
+    expect(409, status, "pre-start scan rejected before the start window")
+
+    # Provisional result combines both chips and keeps the original chip on
+    # each used scan.
+    status, body = request("GET", f"{crp}/results")
+    row = next(r for r in body["results"] if r["bib"] == "F01")
+    assert row["status"] == "finished"
+    assert [u["scan_no"] for u in row["used_scans"]] == [
+        "F-010", "F-020", "F-030"
+    ]
+    assert [u["chip"] for u in row["used_scans"]] == [
+        "CHIP-F", "CHIP-F2", "CHIP-F2"
+    ]
+    print("ok provisional result stitches CHIP-F then CHIP-F2, original "
+          "chips preserved per scan")
+
+    # A replacement that would invalidate a received scan is rejected as a
+    # whole: Grace has an old-chip scan at minute 40 (even revoking it does
+    # not help -- revoked scans still participate in this check).
+    status, _ = fscan("G-040", "CHIP-G", "C2", 40)
+    expect(201, status, "Grace old-chip C2 at minute 40")
+    status, body = request(
+        "POST",
+        f"{crp}/runners/{grace_id}/chip-replacements",
+        {"new_chip": "CHIP-G2", "effective_at": at(30)},
+    )
+    show(status, body)
+    expect(409, status, "replacement conflicting with received scan rejected")
+    assert body["error"] == "chip_replacement_conflict"
+    status, _ = request("DELETE", f"{crp}/scans/G-040")
+    expect(200, status, "revoke Grace's scan")
+    status, body = request(
+        "POST",
+        f"{crp}/runners/{grace_id}/chip-replacements",
+        {"new_chip": "CHIP-G2", "effective_at": at(30)},
+    )
+    expect(409, status, "revoked scan still blocks the same replacement")
+    status, _ = request(
+        "POST",
+        f"{crp}/runners/{grace_id}/chip-replacements",
+        {"new_chip": "CHIP-G2", "effective_at": at(41)},
+    )
+    expect(201, status, "replacement after every received scan accepted")
+
+    # Illegal inputs: reused chip (another runner / prior chip), bad window,
+    # non-increasing effective time, unknown runner.
+    status, body = request(
+        "POST",
+        f"{crp}/runners/{frank_id}/chip-replacements",
+        {"new_chip": "CHIP-F", "effective_at": at(40)},
+    )
+    expect(409, status, "reusing Frank's original chip rejected")
+    assert body["error"] == "chip_reused"
+    status, body = request(
+        "POST",
+        f"{crp}/runners/{frank_id}/chip-replacements",
+        {"new_chip": "CHIP-G2", "effective_at": at(40)},
+    )
+    expect(409, status, "reusing Grace's replacement chip rejected")
+    status, body = request(
+        "POST",
+        f"{crp}/runners/{frank_id}/chip-replacements",
+        {"new_chip": "CHIP-F3", "effective_at": at(14)},
+    )
+    expect(422, status, "effective time not later than previous rejected")
+    assert body["error"] == "invalid_effective_time"
+    status, body = request(
+        "POST",
+        f"{crp}/runners/{frank_id}/chip-replacements",
+        {"new_chip": "CHIP-F3", "effective_at": at(61)},
+    )
+    expect(422, status, "effective time after cutoff rejected")
+    status, body = request(
+        "GET",
+        f"{crp}/runners/00000000-0000-0000-0000-000000000000/chip-timeline",
+    )
+    expect(404, status, "unknown runner timeline 404")
+
+    # Sealing freezes the timeline policy: no replacements afterwards, and
+    # the snapshot is unaffected.
+    status, _ = request("POST", f"{crp}/seal")
+    expect(200, status, "chip-replacement race sealed")
+    status, body = request(
+        "POST",
+        f"{crp}/runners/{frank_id}/chip-replacements",
+        {"new_chip": "CHIP-F9", "effective_at": at(45)},
+    )
+    show(status, body)
+    expect(409, status, "replacement after sealing rejected")
+    status, body = request(
+        "GET", f"{crp}/runners/{frank_id}/chip-timeline"
+    )
+    expect(200, status, "timeline still readable after sealing")
 
     print("\nALL DEMO STEPS PASSED")
 

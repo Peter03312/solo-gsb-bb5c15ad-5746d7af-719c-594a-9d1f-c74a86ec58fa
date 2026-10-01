@@ -85,3 +85,66 @@ echo "## offset change after sealing (HTTP 409)"
 curl -sS -o /dev/null -w '%{http_code}\n' -X PUT \
   "$BASE_URL/races/$RACE_ID/points/C1/offset" \
   -H 'Content-Type: application/json' -d '{"offset_seconds": 0}'
+
+# ---------------------------------------------------------------------------
+# Mid-race chip replacement (second race, keeps the walkthrough independent)
+# ---------------------------------------------------------------------------
+echo "## chip replacement: create a race with runner 1 on CHIP-A"
+CR=$(curl -fsS -X POST "$BASE_URL/races" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"name\": \"chip replacement curl demo\",
+    \"start_time\": \"$T0\",
+    \"cutoff_time\": \"$(AT 3600)\",
+    \"points\": [
+      {\"code\": \"C1\", \"name\": \"Checkpoint 1\"},
+      {\"code\": \"FIN\", \"name\": \"Finish\", \"is_finish\": true}
+    ],
+    \"segments\": [
+      {\"min_seconds\": 300, \"max_seconds\": 3600},
+      {\"min_seconds\": 300, \"max_seconds\": 3600}
+    ],
+    \"runners\": [
+      {\"bib\": \"1\", \"name\": \"Alice\", \"chip\": \"CHIP-A\"}
+    ]
+  }")
+echo "$CR"
+CHIP_RACE_ID=$(echo "$CR" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+RUNNER_ID=$(echo "$CR" | python3 -c 'import json,sys;print(json.load(sys.stdin)["runners"][0]["id"])')
+
+echo "## register CHIP-A -> CHIP-A2 effective at T0+900s (HTTP 201)"
+curl -fsS -X POST \
+  "$BASE_URL/races/$CHIP_RACE_ID/runners/$RUNNER_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"new_chip\": \"CHIP-A2\", \"effective_at\": \"$(AT 900)\", \"note\": \"broken chip\"}"
+echo
+
+echo "## query the chip timeline (periods + replacement events)"
+curl -fsS "$BASE_URL/races/$CHIP_RACE_ID/runners/$RUNNER_ID/chip-timeline"; echo
+
+echo "## old chip before the boundary (T0+800s) is still valid -> 201"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$CHIP_RACE_ID/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{\"scan_no\":\"OLD-OK\",\"chip\":\"CHIP-A\",\"point\":\"C1\",\"occurred_at\":\"$(AT 800)\"}"
+
+echo "## old chip at/after the boundary is explicitly rejected (HTTP 409)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$CHIP_RACE_ID/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{\"scan_no\":\"OLD-BAD\",\"chip\":\"CHIP-A\",\"point\":\"C1\",\"occurred_at\":\"$(AT 900)\"}"
+
+echo "## new chip at the boundary is valid -> 201"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$CHIP_RACE_ID/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{\"scan_no\":\"NEW-OK\",\"chip\":\"CHIP-A2\",\"point\":\"FIN\",\"occurred_at\":\"$(AT 1800)\"}"
+
+echo "## reusing an already-used chip number is rejected (HTTP 409 chip_reused)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE_URL/races/$CHIP_RACE_ID/runners/$RUNNER_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"new_chip\": \"CHIP-A\", \"effective_at\": \"$(AT 1200)\"}"
+
+echo "## effective time outside the start..cutoff window is rejected (HTTP 422)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE_URL/races/$CHIP_RACE_ID/runners/$RUNNER_ID/chip-replacements" \
+  -H 'Content-Type: application/json' \
+  -d "{\"new_chip\": \"CHIP-A3\", \"effective_at\": \"$(AT 4000)\"}"

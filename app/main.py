@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from . import service
 from .database import SessionLocal, init_db
 from .schemas import (
+    ChipReplacementIn,
+    ChipTimelineOut,
     ClockOffsetIn,
     ClockOffsetListOut,
     ErrorBody,
@@ -35,11 +37,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Road Race Split Timing Adjudication Service",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "Race configuration, out-of-order chip scan ingestion with "
-        "idempotent replay/conflict detection, per-point signed integer "
+        "idempotent replay/conflict detection, mid-race chip replacement "
+        "with half-open chip validity periods, per-point signed integer "
         "clock offsets, provisional results on calibrated times, scan "
         "revocation and sealing of a frozen result snapshot."
     ),
@@ -144,6 +147,43 @@ def revoke_scan(
 ) -> dict:
     scan = service.revoke_scan(db, race_id, scan_no)
     return service.serialize_scan(scan)
+
+
+# --------------------------------------------------------------------------
+# Chip replacements
+# --------------------------------------------------------------------------
+
+
+@app.get(
+    "/races/{race_id}/runners/{runner_id}/chip-timeline",
+    response_model=ChipTimelineOut,
+    tags=["chip-replacement"],
+    responses={404: {"model": ErrorBody}},
+)
+def get_chip_timeline(
+    race_id: str, runner_id: str, db: Session = Depends(get_db)
+) -> dict:
+    return service.chip_timeline(db, race_id, runner_id)
+
+
+@app.post(
+    "/races/{race_id}/runners/{runner_id}/chip-replacements",
+    response_model=ChipTimelineOut,
+    status_code=201,
+    tags=["chip-replacement"],
+    responses={
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+    },
+)
+def post_chip_replacement(
+    race_id: str,
+    runner_id: str,
+    payload: ChipReplacementIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    return service.register_chip_replacement(db, race_id, runner_id, payload)
 
 
 # --------------------------------------------------------------------------
